@@ -1,97 +1,133 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {ERC721}           from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-import {ERC721Enumerable} from "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
-import {Ownable}          from "@openzeppelin/contracts/access/Ownable.sol";
-import {AccessControl}    from "@openzeppelin/contracts/access/AccessControl.sol";
-import {Pausable}         from "@openzeppelin/contracts/utils/Pausable.sol";
+import {ERC721}        from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import {Ownable}       from "@openzeppelin/contracts/access/Ownable.sol";
+import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+import {Pausable}      from "@openzeppelin/contracts/utils/Pausable.sol";
 
-// -----------------------------------------------------------------------------
-// IMembershipChecker — shared interface implemented by this contract
-// and consumed by VaultMates (and any future protocol contract).
-// -----------------------------------------------------------------------------
+// =============================================================================
+// IMembershipChecker
+// =============================================================================
 
 /**
  * @title  IMembershipChecker
- * @notice Minimal view interface for on-chain membership gate integration.
- * @dev    VaultMates.setMembershipContract() expects this interface.
- *         Any contract that calls isMember() should use staticcall so that
- *         this contract's view guarantee is enforced at the call site.
+ * @notice Minimal view interface consumed by VaultMates (and any future
+ *         protocol contract) to gate access on active membership status.
+ * @dev    VaultMates.setMembershipContract() expects exactly this interface.
+ *         Callers invoke isMember() via staticcall so that the view guarantee
+ *         is enforced at the call site regardless of future overrides.
  */
 interface IMembershipChecker {
     /**
-     * @notice Returns true if `account` currently holds a valid membership.
+     * @notice Returns true when `account` is an active member.
      * @param  account  Address to test.
-     * @return          True if the address owns at least one membership token
-     *                  AND (when approval mode is on) was approved by the owner.
+     * @return          True if `account` holds a token AND (when
+     *                  approvalRequired == true) has been explicitly approved.
      */
     function isMember(address account) external view returns (bool);
 }
 
-// -----------------------------------------------------------------------------
+// =============================================================================
 // VaultMatesMembership
-// -----------------------------------------------------------------------------
+// =============================================================================
 
 /**
  * @title  VaultMatesMembership
  * @author VaultMates Protocol
  * @notice ERC-721 NFT membership contract for the VaultMates protocol.
- *         Each address may hold exactly one token. The owner can require
- *         explicit approval before a minted token becomes an active membership.
+ *         Each address may hold exactly one token. The owner may optionally
+ *         require explicit approval before a minted token grants active
+ *         membership. Exposes isMember(address) to satisfy IMembershipChecker
+ *         so VaultMates can gate deposits without knowing implementation details.
  *
- * ── DESIGN DECISIONS ─────────────────────────────────────────────────────────
+ * ---- MODES ------------------------------------------------------------------
  *
- *  One-per-address invariant
- *    Enforced in _update() — the internal hook called by every mint, burn, and
- *    transfer. This is cheaper than a modifier on every public function and
- *    covers all transfer paths including safeTransferFrom.
+ *   Open mode   (approvalRequired == false, default)
+ *     Minting is self-service. Holding a token immediately means isMember()
+ *     returns true. No further action required.
  *
- *  Approval mode (optional)
- *    When approvalRequired == true, minting a token does NOT automatically
- *    make the holder a member. The owner (or APPROVER_ROLE) must call
- *    approveMember(). This supports KYC / allowlist workflows.
- *    When approvalRequired == false, holding the token IS membership.
+ *   Gated mode  (approvalRequired == true)
+ *     Minting issues the NFT but the holder is NOT yet a member. An address
+ *     with APPROVER_ROLE must call approveMember() before isMember() returns
+ *     true. Supports KYC / allowlist / DAO-vote workflows.
  *
- *  Non-transferable option
- *    The owner can lock tokens as soulbound (non-transferable) at any time.
- *    Existing holders keep their tokens; future transfers are blocked.
+ * ---- OWNABLE ACCESS CONTROL -------------------------------------------------
  *
- *  isMember(address)
- *    Single view function satisfying IMembershipChecker. VaultMates uses this
- *    via staticcall in its onlyMember modifier. Returns true iff:
- *      (a) address holds a token, AND
- *      (b) if approvalRequired: address has been approved.
+ *   Single privileged owner governs all administrative functions:
+ *     pause() / unpause()        Emergency halt and resume.
+ *     setApprovalRequired(bool)  Toggle gated vs. open membership mode.
+ *     setTransferable(bool)      Toggle soulbound vs. transferable tokens.
+ *     burnFrom(address)          Force-remove any member.
+ *     transferOwnership(address) Migrate to a Safe or Timelock.
  *
- *  Role separation for DAO readiness
- *    DEFAULT_ADMIN_ROLE  — root; can grant/revoke all roles.
- *    APPROVER_ROLE       — can approve/revoke individual members; intended for
- *                          a DAO contract or multisig approval committee.
- *    MINTER_ROLE         — can mint on behalf of an address (airdrop / DAO grant).
- *                          Not needed for self-mint; any address can call mint().
+ *   renounceOwnership() is permanently blocked to prevent accidental
+ *   admin loss. Always use transferOwnership() to migrate.
  *
- *  Token IDs
- *    Sequential, starting at 1. tokenId 0 is intentionally skipped so that
- *    a zero tokenId can serve as a sentinel "no token" value in integrations.
+ * ---- ACCESSCONTROL (DAO READINESS) ------------------------------------------
  *
- * ── GAS OPTIMISATIONS ────────────────────────────────────────────────────────
- *  - _approved and _tokenOf mappings use uint256 (fits one slot; bool packs
- *    with nothing useful here, so uint256 is idiomatic for ERC-721 contexts).
- *  - isMember() is a two-SLOAD view: balanceOf (via ERC721 _balances) +
- *    _approved lookup. No array iteration.
- *  - _nextTokenId is a single storage slot incremented with unchecked arithmetic.
- *  - ERC721Enumerable is included for DAO snapshot tooling; callers that only
- *    need isMember() pay nothing extra (view functions cost no gas on-chain).
+ *   DEFAULT_ADMIN_ROLE  Root of the role hierarchy; can grant/revoke roles.
+ *   APPROVER_ROLE       approve / revoke individual members. Assign to a
+ *                       DAO committee, multisig, or on-chain governance.
+ *   MINTER_ROLE         Call mintTo(address) on behalf of other addresses.
+ *                       Assign to airdrop contracts or DAO grant proposals.
  *
- * ── SECURITY ─────────────────────────────────────────────────────────────────
- *  - One-per-address enforced at the _update() hook level (covers all paths).
- *  - renounceOwnership() blocked — prevents accidental permanent admin loss.
- *  - Pause blocks mint, approve, revoke, and transfer; emergency burn allowed.
- *  - approvalRequired and transferable flags are owner-controlled and emit events.
+ * ---- PAUSABLE FUNCTIONALITY -------------------------------------------------
+ *
+ *   Owner calls pause() to freeze the contract in an emergency.
+ *   When paused the following REVERT:
+ *     mint(), mintTo()
+ *     approveMember(), approveMemberBatch()
+ *     revokeMember(), revokeMemberBatch()
+ *     ERC-721 transfers (safeTransferFrom, transferFrom)
+ *   The following REMAIN AVAILABLE while paused:
+ *     burn()      -- users must always be able to exit voluntarily.
+ *     burnFrom()  -- owner must always be able to enforce removal.
+ *
+ * ---- MEMBERSHIP ID COUNTER --------------------------------------------------
+ *
+ *   _nextTokenId  (monotonic, never decrements)
+ *     Sequential IDs starting at 1. Token ID 0 is reserved as the
+ *     unambiguous "no membership" sentinel. Never reused after a burn.
+ *
+ *   _memberCount  (live, inc on mint / dec on burn)
+ *     Current number of addresses holding a token. totalMembers() reads
+ *     this in O(1) with a single SLOAD. No ERC721Enumerable required.
+ *
+ * ---- STORAGE LAYOUT ---------------------------------------------------------
+ *
+ *   Slot   Variable            Type       Notes
+ *   -----  ------------------  ---------  ------------------------------------
+ *   +0     _nextTokenId        uint256    Monotonic; ID 0 is sentinel
+ *   +1     _memberCount        uint256    Live holder count
+ *   +2     approvalRequired    bool       Packed together -- one SLOAD for both
+ *   +2     transferable        bool       Packed together -- one SLOAD for both
+ *   +3     _approved           mapping    address -> bool; gated-mode state
+ *   +4     _memberToken        mapping    address -> tokenId (0 = no token)
+ *
+ * ---- GAS OPTIMISATIONS ------------------------------------------------------
+ *
+ *   - approvalRequired + transferable share one 32-byte slot (one SLOAD).
+ *   - _memberCount uses unchecked inc/dec (invariants proven in NatSpec).
+ *   - _nextTokenId uses unchecked post-increment (2^256 overflow impossible).
+ *   - isMember() and onlyMember short-circuit on first false condition.
+ *   - Single _memberToken mapping replaces two (was _tokenOf + _memberId).
+ *   - No ERC721Enumerable: saves ~3 SSTOREs per mint, ~3 SSTOREs per burn.
+ *   - Batch functions use calldata arrays (zero memory copy) + unchecked ++i.
+ *   - burn() / burnFrom() pre-read tokenId from _memberToken (avoids 2nd SLOAD).
+ *   - Custom errors replace revert strings (~200 gas saved per revert path).
+ *   - _update() handles all protocol checks in one internal hook.
+ *
+ * ---- SECURITY ---------------------------------------------------------------
+ *
+ *   - One-per-address invariant enforced in _update() -- covers every ERC-721
+ *     transition path including safeTransferFrom and transferFrom. No bypass.
+ *   - renounceOwnership() permanently disabled.
+ *   - Burns bypass pause -- users cannot be permanently trapped.
+ *   - Typed custom errors on all privileged and invariant-failure paths.
  */
 contract VaultMatesMembership is
     ERC721,
-    ERC721Enumerable,
     Ownable,
     AccessControl,
     Pausable,
@@ -103,16 +139,18 @@ contract VaultMatesMembership is
 
     /**
      * @notice Approver role.
-     * @dev    Holders can call approveMember() and revokeMember().
-     *         Intended for a DAO approval committee or multisig.
-     *         Assign via grantRole(APPROVER_ROLE, daoContract).
+     * @dev    Holders may call approveMember(), approveMemberBatch(),
+     *         revokeMember(), and revokeMemberBatch(). Intended for a DAO
+     *         approval committee, multisig, or on-chain governance contract.
+     *         Grant via: grantRole(APPROVER_ROLE, daoContract)
      */
     bytes32 public constant APPROVER_ROLE = keccak256("APPROVER_ROLE");
 
     /**
      * @notice Minter role.
-     * @dev    Holders can call mintTo(address) to mint on behalf of others
-     *         (airdrops, DAO membership grants). Not required for self-mint.
+     * @dev    Holders may call mintTo(address) on behalf of other addresses.
+     *         Not required for self-mint via mint(). Intended for airdrop
+     *         contracts and DAO grant proposals.
      */
     bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
 
@@ -120,98 +158,158 @@ contract VaultMatesMembership is
     // Storage
     // =========================================================================
 
-    /// @dev Next token ID to mint. Starts at 1; 0 is reserved as "no token".
+    /**
+     * @notice Monotonically increasing counter used to assign token IDs.
+     * @dev    Starts at 1. Token ID 0 is the "no membership" sentinel returned
+     *         by getMemberId() and tokenOf() for addresses with no token.
+     *         Incremented with unchecked arithmetic; 2^256 overflow is physically
+     *         impossible.
+     */
     uint256 private _nextTokenId;
 
     /**
-     * @notice Whether minting a token requires subsequent owner/approver approval
-     *         before isMember() returns true for that address.
-     * @dev    When false: holding a token == membership (open mode).
-     *         When true:  holding a token requires explicit approval (gated mode).
+     * @notice Live count of addresses currently holding a membership token.
+     * @dev    Incremented in _mintMembership(); decremented in _burnMembership().
+     *         Underflow is impossible: decrement only occurs when a token exists
+     *         (_memberCount >= 1). Exposed via totalMembers().
+     */
+    uint256 private _memberCount;
+
+    /**
+     * @notice When true, minting issues the NFT but does NOT grant active
+     *         membership until an APPROVER_ROLE holder calls approveMember().
+     * @dev    Packed with `transferable` into the same 32-byte storage slot.
      */
     bool public approvalRequired;
 
     /**
-     * @notice Whether tokens are non-transferable (soulbound).
-     * @dev    When true, all transfers (except mint and burn) revert.
-     *         Mint = transfer from address(0). Burn = transfer to address(0).
+     * @notice When false, wallet-to-wallet transfers revert (soulbound mode).
+     * @dev    Mint and burn always permitted regardless of this flag.
+     *         Packed with approvalRequired.
      */
     bool public transferable;
 
-    /// @dev address => approved membership status. Only meaningful when approvalRequired == true.
+    /// @dev address -> explicit approval state. Only meaningful when approvalRequired == true.
     mapping(address => bool) private _approved;
 
-    /// @dev address => tokenId owned. 0 means no token. Used for O(1) "does this address own a token?" checks.
-    mapping(address => uint256) private _tokenOf;
+    /**
+     * @dev address -> ERC-721 token ID currently held. 0 = no token.
+     *      Serves dual purpose: tokenOf() and getMemberId() both read this slot.
+     *      Updated in _update() on every mint, transfer, and burn.
+     */
+    mapping(address => uint256) private _memberToken;
 
     // =========================================================================
     // Events
     // =========================================================================
 
     /**
-     * @notice Emitted when a membership token is minted.
-     * @param  to      Recipient address.
-     * @param  tokenId Token ID minted.
+     * @notice Emitted when a new membership token is minted.
+     * @param  to        Address that received the membership token.
+     * @param  tokenId   ERC-721 token ID minted.
+     * @param  memberId  Membership ID assigned (equals tokenId in v1).
+     * @param  totalNow  totalMembers() value immediately after this mint.
      */
-    event MembershipMinted(address indexed to, uint256 indexed tokenId);
+    event MembershipMinted(
+        address indexed to,
+        uint256 indexed tokenId,
+        uint256         memberId,
+        uint256         totalNow
+    );
 
     /**
-     * @notice Emitted when a membership token is burned.
-     * @param  account Address whose token was burned.
-     * @param  tokenId Token ID burned.
+     * @notice Emitted when a membership token is burned (voluntary or forced).
+     * @dev    Fired by both burn() and burnFrom(). After this event,
+     *         getMemberId(account) returns 0 and isMember(account) returns false.
+     * @param  account   Address whose membership was revoked.
+     * @param  tokenId   ERC-721 token ID burned.
+     * @param  memberId  Membership ID cleared.
+     * @param  totalNow  totalMembers() value immediately after this burn.
      */
-    event MembershipBurned(address indexed account, uint256 indexed tokenId);
+    event MembershipRevoked(
+        address indexed account,
+        uint256 indexed tokenId,
+        uint256         memberId,
+        uint256         totalNow
+    );
 
     /**
-     * @notice Emitted when an address is approved as a member.
-     * @param  account  Address approved.
-     * @param  approver Address that approved (owner or APPROVER_ROLE).
+     * @notice Emitted when an address receives explicit membership approval.
+     * @param  account   Address approved.
+     * @param  approver  Address that granted the approval.
      */
     event MemberApproved(address indexed account, address indexed approver);
 
     /**
-     * @notice Emitted when an address has its membership approval revoked.
-     * @param  account Address revoked.
-     * @param  revoker Address that revoked.
+     * @notice Emitted when an address has its approval cleared without burning.
+     * @param  account  Address whose approval was cleared.
+     * @param  revoker  Address that performed the revocation.
      */
-    event MemberRevoked(address indexed account, address indexed revoker);
+    event MemberApprovalRevoked(address indexed account, address indexed revoker);
 
-    /**
-     * @notice Emitted when the approvalRequired flag changes.
-     * @param  required New value.
-     */
+    /// @notice Emitted when the approvalRequired flag changes.
     event ApprovalModeChanged(bool indexed required);
 
-    /**
-     * @notice Emitted when the transferable flag changes.
-     * @param  transferable New value.
-     */
-    event TransferabilityChanged(bool indexed transferable);
+    /// @notice Emitted when the transferable flag changes.
+    event TransferabilityChanged(bool indexed isTransferable);
 
     // =========================================================================
     // Custom Errors
     // =========================================================================
 
-    /// @dev Caller already owns a membership token.
+    /// @dev Caller already holds a membership token.
     error AlreadyMember(address account);
 
-    /// @dev Target address already owns a membership token (for mintTo).
+    /// @dev mintTo() destination or transfer target already holds a token.
     error TargetAlreadyMember(address account);
 
-    /// @dev Caller does not own a membership token.
+    /// @dev Address holds no membership token.
     error NotTokenHolder(address account);
 
-    /// @dev Caller is not authorised to perform this action.
+    /// @dev onlyMember: caller is not an active member.
+    error CallerNotMember(address caller);
+
+    /// @dev onlyApprover: caller lacks owner or APPROVER_ROLE.
     error Unauthorized();
 
-    /// @dev Token transfer is blocked because transferable == false.
+    /// @dev Transfer blocked because transferable == false.
     error TransferLocked();
 
-    /// @dev renounceOwnership is permanently disabled.
+    /// @dev renounceOwnership() is permanently disabled.
     error RenounceOwnershipDisabled();
 
     /// @dev address(0) supplied where a real address is required.
     error ZeroAddress();
+
+    // =========================================================================
+    // Modifiers
+    // =========================================================================
+
+    /**
+     * @notice Restricts a function to active members only.
+     * @dev    Inline check -- avoids ~700 gas cross-contract staticcall overhead.
+     *
+     *         Short-circuit (1-3 SLOADs):
+     *           SLOAD 1  _memberToken[msg.sender] == 0  -> revert (no token)
+     *           SLOAD 2  approvalRequired == false       -> pass  (open mode)
+     *           SLOAD 3  _approved[msg.sender] == false  -> revert (gated)
+     */
+    modifier onlyMember() {
+        if (_memberToken[msg.sender] == 0)
+            revert CallerNotMember(msg.sender);
+        if (approvalRequired && !_approved[msg.sender])
+            revert CallerNotMember(msg.sender);
+        _;
+    }
+
+    /**
+     * @dev Restricts to the contract owner or any APPROVER_ROLE holder.
+     */
+    modifier onlyApprover() {
+        if (msg.sender != owner() && !hasRole(APPROVER_ROLE, msg.sender))
+            revert Unauthorized();
+        _;
+    }
 
     // =========================================================================
     // Constructor
@@ -219,10 +317,13 @@ contract VaultMatesMembership is
 
     /**
      * @notice Deploy VaultMatesMembership.
-     * @param  initialOwner      Receives Ownable ownership and DEFAULT_ADMIN_ROLE.
-     *                           Should be a multisig or Timelock in production.
-     * @param  _approvalRequired Initial value for approvalRequired flag.
-     * @param  _transferable     Initial value for transferable flag.
+     * @dev    initialOwner receives Ownable ownership, DEFAULT_ADMIN_ROLE,
+     *         APPROVER_ROLE, and MINTER_ROLE. In production transfer ownership
+     *         to a Gnosis Safe or Timelock post-deployment.
+     *
+     * @param  initialOwner       Non-zero address receiving all initial privileges.
+     * @param  _approvalRequired  false = open mode; true = gated mode.
+     * @param  _transferable      true = tokens transfer freely; false = soulbound.
      */
     constructor(
         address initialOwner,
@@ -241,22 +342,23 @@ contract VaultMatesMembership is
         approvalRequired = _approvalRequired;
         transferable     = _transferable;
 
-        // Consume tokenId 0 so the first real token is ID 1.
-        // _nextTokenId starts at 0; first mint increments to 1.
+        // Token ID 0 is reserved as the "no membership" sentinel.
         _nextTokenId = 1;
     }
 
     // =========================================================================
-    // External — Minting
+    // External -- Minting
     // =========================================================================
 
     /**
      * @notice Mint a membership token to the caller.
-     * @dev    Any address without an existing token can call this (open mint).
-     *         If approvalRequired == true, the caller is NOT yet a member until
-     *         approveMember() is called by an owner or APPROVER_ROLE holder.
-     *         Reverts if the caller already holds a token.
-     *         Reverts when paused.
+     * @dev    One-per-address invariant enforced in _update(). If approvalRequired
+     *         == true, the caller receives the NFT but isMember() returns false
+     *         until approveMember() is called.
+     *
+     * @custom:throws EnforcedPause  Contract is paused.
+     * @custom:throws AlreadyMember  Caller already holds a token.
+     * @custom:emits  MembershipMinted
      */
     function mint() external whenNotPaused {
         _mintMembership(msg.sender);
@@ -264,73 +366,93 @@ contract VaultMatesMembership is
 
     /**
      * @notice Mint a membership token to an arbitrary address.
-     * @dev    Restricted to MINTER_ROLE. Useful for airdrops and DAO grants.
-     *         If approvalRequired == true, the recipient is not yet a member
-     *         until approveMember() is called.
-     * @param  to Recipient address. Must not already hold a token.
+     * @dev    Restricted to MINTER_ROLE. Intended for DAO grants and airdrops.
+     *
+     * @param  to  Recipient. Must be non-zero and not already hold a token.
+     *
+     * @custom:throws EnforcedPause       Contract is paused.
+     * @custom:throws ZeroAddress         to == address(0).
+     * @custom:throws TargetAlreadyMember to already holds a token.
+     * @custom:emits  MembershipMinted
      */
-    function mintTo(address to) external onlyRole(MINTER_ROLE) whenNotPaused {
+    function mintTo(address to)
+        external
+        onlyRole(MINTER_ROLE)
+        whenNotPaused
+    {
         if (to == address(0)) revert ZeroAddress();
         _mintMembership(to);
     }
 
     // =========================================================================
-    // External — Burning
+    // External -- Burning
     // =========================================================================
 
     /**
-     * @notice Burn the caller's own membership token.
-     * @dev    Clears approval status for the caller. Does not require
-     *         whenNotPaused — users must always be able to exit.
-     *         Reverts if the caller holds no token.
+     * @notice Burn the caller's own membership token (voluntary exit).
+     * @dev    Intentionally omits whenNotPaused -- users must always be able
+     *         to exit even during an emergency pause.
+     *
+     * @custom:throws NotTokenHolder  Caller holds no token.
+     * @custom:emits  MembershipRevoked
      */
     function burn() external {
-        uint256 tokenId = _tokenOf[msg.sender];
+        uint256 tokenId = _memberToken[msg.sender];
         if (tokenId == 0) revert NotTokenHolder(msg.sender);
         _burnMembership(msg.sender, tokenId);
     }
 
     /**
-     * @notice Burn any address's membership token.
-     * @dev    Restricted to owner. Used for enforcement / compliance.
-     *         Clears the address's approval status.
-     *         Does not require whenNotPaused — admin revocation must always work.
-     * @param  account Address whose token to burn.
+     * @notice Force-burn any address's membership token.
+     * @dev    Owner-only. Intentionally omits whenNotPaused -- admin removals
+     *         must always be possible regardless of pause state.
+     *
+     * @param  account  Address to remove.
+     *
+     * @custom:throws NotTokenHolder  account holds no token.
+     * @custom:emits  MembershipRevoked
      */
     function burnFrom(address account) external onlyOwner {
-        uint256 tokenId = _tokenOf[account];
+        uint256 tokenId = _memberToken[account];
         if (tokenId == 0) revert NotTokenHolder(account);
         _burnMembership(account, tokenId);
     }
 
     // =========================================================================
-    // External — Approval Management
+    // External -- Approval Management
     // =========================================================================
 
     /**
-     * @notice Approve an address as an active member.
-     * @dev    Only meaningful when approvalRequired == true.
-     *         Can be called by owner or any APPROVER_ROLE holder.
-     *         The address must already hold a token before it can be approved.
-     *         Reverts when paused.
-     * @param  account Address to approve.
+     * @notice Approve a single token holder as an active member.
+     * @dev    Only meaningful when approvalRequired == true. Address must
+     *         already hold a token.
+     *
+     * @param  account  Address to approve.
+     *
+     * @custom:throws EnforcedPause   Contract is paused.
+     * @custom:throws Unauthorized    Caller lacks owner or APPROVER_ROLE.
+     * @custom:throws NotTokenHolder  account holds no token.
+     * @custom:emits  MemberApproved
      */
     function approveMember(address account)
         external
         whenNotPaused
         onlyApprover
     {
-        if (_tokenOf[account] == 0) revert NotTokenHolder(account);
+        if (_memberToken[account] == 0) revert NotTokenHolder(account);
         _approved[account] = true;
         emit MemberApproved(account, msg.sender);
     }
 
     /**
-     * @notice Approve multiple addresses in a single transaction.
-     * @dev    Restricted to owner or APPROVER_ROLE. Gas-efficient batch path.
-     *         Silently skips addresses with no token (no revert) to allow
-     *         partial lists without halting.
-     * @param  accounts Array of addresses to approve.
+     * @notice Approve multiple token holders in one transaction.
+     * @dev    Silently skips addresses with no token (no revert on partial lists).
+     *
+     * @param  accounts  Calldata array of addresses to approve.
+     *
+     * @custom:throws EnforcedPause  Contract is paused.
+     * @custom:throws Unauthorized   Caller lacks owner or APPROVER_ROLE.
+     * @custom:emits  MemberApproved for each successfully approved address.
      */
     function approveMemberBatch(address[] calldata accounts)
         external
@@ -340,7 +462,7 @@ contract VaultMatesMembership is
         uint256 len = accounts.length;
         for (uint256 i; i < len; ) {
             address account = accounts[i];
-            if (_tokenOf[account] != 0) {
+            if (_memberToken[account] != 0) {
                 _approved[account] = true;
                 emit MemberApproved(account, msg.sender);
             }
@@ -349,12 +471,15 @@ contract VaultMatesMembership is
     }
 
     /**
-     * @notice Revoke an address's active membership approval.
-     * @dev    Does NOT burn the token. The address keeps its NFT but
-     *         isMember() returns false until re-approved.
-     *         Only meaningful when approvalRequired == true.
-     *         Restricted to owner or APPROVER_ROLE.
-     * @param  account Address to revoke.
+     * @notice Revoke explicit membership approval from a single address.
+     * @dev    Does NOT burn the token. isMember() returns false until
+     *         approveMember() is called again.
+     *
+     * @param  account  Address to revoke.
+     *
+     * @custom:throws EnforcedPause  Contract is paused.
+     * @custom:throws Unauthorized   Caller lacks owner or APPROVER_ROLE.
+     * @custom:emits  MemberApprovalRevoked
      */
     function revokeMember(address account)
         external
@@ -362,13 +487,17 @@ contract VaultMatesMembership is
         onlyApprover
     {
         _approved[account] = false;
-        emit MemberRevoked(account, msg.sender);
+        emit MemberApprovalRevoked(account, msg.sender);
     }
 
     /**
-     * @notice Revoke membership approval for multiple addresses.
-     * @dev    Restricted to owner or APPROVER_ROLE.
-     * @param  accounts Array of addresses to revoke.
+     * @notice Revoke approval from multiple addresses in one transaction.
+     *
+     * @param  accounts  Calldata array of addresses to revoke.
+     *
+     * @custom:throws EnforcedPause  Contract is paused.
+     * @custom:throws Unauthorized   Caller lacks owner or APPROVER_ROLE.
+     * @custom:emits  MemberApprovalRevoked for each address.
      */
     function revokeMemberBatch(address[] calldata accounts)
         external
@@ -378,22 +507,21 @@ contract VaultMatesMembership is
         uint256 len = accounts.length;
         for (uint256 i; i < len; ) {
             _approved[accounts[i]] = false;
-            emit MemberRevoked(accounts[i], msg.sender);
+            emit MemberApprovalRevoked(accounts[i], msg.sender);
             unchecked { ++i; }
         }
     }
 
     // =========================================================================
-    // External — Owner Configuration
+    // External -- Owner Configuration
     // =========================================================================
 
     /**
      * @notice Toggle whether minting requires subsequent owner approval.
-     * @dev    Changing from true -> false immediately makes all token holders
-     *         active members (approval state is ignored when flag is off).
-     *         Changing from false -> true does NOT retroactively revoke anyone;
-     *         existing holders remain members unless explicitly revoked.
-     * @param  required New value for approvalRequired.
+     * @dev    false->true: existing non-approved holders lose access until approved.
+     *         true->false: all token holders immediately become active members.
+     *
+     * @custom:emits ApprovalModeChanged
      */
     function setApprovalRequired(bool required) external onlyOwner {
         approvalRequired = required;
@@ -401,11 +529,10 @@ contract VaultMatesMembership is
     }
 
     /**
-     * @notice Toggle whether tokens can be transferred between addresses.
-     * @dev    Setting to false makes all tokens soulbound from that point on.
-     *         Existing holders keep their tokens; only future transfers are blocked.
-     *         Mint (from address(0)) and burn (to address(0)) are always allowed.
-     * @param  _transferable New value for transferable.
+     * @notice Toggle whether tokens may be transferred between wallets.
+     * @dev    Mint and burn remain permitted regardless of this flag.
+     *
+     * @custom:emits TransferabilityChanged
      */
     function setTransferable(bool _transferable) external onlyOwner {
         transferable = _transferable;
@@ -413,135 +540,146 @@ contract VaultMatesMembership is
     }
 
     /**
-     * @notice Pause mint, approve, revoke, and transfer operations.
-     * @dev    burn() and burnFrom() intentionally remain available when paused.
+     * @notice Pause minting, approval management, and ERC-721 transfers.
+     * @dev    burn() and burnFrom() remain available while paused.
+     * @custom:emits OZ Paused(address)
      */
-    function pause() external onlyOwner {
-        _pause();
-    }
+    function pause() external onlyOwner { _pause(); }
 
     /**
-     * @notice Unpause the contract and resume normal operations.
+     * @notice Unpause and restore all normal operations.
+     * @custom:emits OZ Unpaused(address)
      */
-    function unpause() external onlyOwner {
-        _unpause();
-    }
+    function unpause() external onlyOwner { _unpause(); }
 
     /**
-     * @notice Disabled — prevents accidental permanent loss of admin access.
-     * @dev    Use transferOwnership() to migrate to a Timelock or DAO.
+     * @notice Permanently disabled -- prevents accidental admin loss.
+     * @dev    Use transferOwnership(newOwner) to migrate to a Safe or Timelock.
+     * @custom:throws RenounceOwnershipDisabled  Always.
      */
     function renounceOwnership() public view override onlyOwner {
         revert RenounceOwnershipDisabled();
     }
 
     // =========================================================================
-    // External — IMembershipChecker (VaultMates integration)
+    // External -- IMembershipChecker
     // =========================================================================
 
     /**
-     * @notice Returns true if `account` is an active member.
-     * @dev    Called by VaultMates.onlyMember via staticcall.
-     *         Logic:
-     *           1. Account must hold a token (_tokenOf[account] != 0).
-     *           2. If approvalRequired == true, account must also be approved.
-     *         Two SLOADs in the worst case; one if the token check fails early.
-     * @param  account Address to query.
-     * @return         True if account is an active member.
+     * @notice Returns true when `account` is an active member.
+     * @dev    VaultMates calls this via staticcall inside its onlyMember modifier.
+     *
+     *         Short-circuit (1-3 SLOADs):
+     *           1. _memberToken[account] == 0  -> false (no token)
+     *           2. approvalRequired == false    -> true  (open mode)
+     *           3. _approved[account]           -> result (gated mode)
+     *
+     * @param  account  Address to query.
+     * @return          True if account is an active member.
      */
     function isMember(address account) external view override returns (bool) {
-        if (_tokenOf[account] == 0) return false;           // SLOAD 1: no token
-        if (!approvalRequired)      return true;            // SLOAD 2: flag check
-        return _approved[account];                          // SLOAD 3: approval
+        if (_memberToken[account] == 0) return false;
+        if (!approvalRequired)          return true;
+        return _approved[account];
     }
 
     // =========================================================================
-    // External — View / Enumeration
+    // External -- View
     // =========================================================================
 
     /**
-     * @notice Returns the token ID owned by `account`, or 0 if none.
-     * @param  account Address to query.
-     * @return         Token ID, or 0.
+     * @notice Returns the live count of addresses holding a membership token.
+     * @dev    O(1) single SLOAD. Replaces ERC721Enumerable.totalSupply().
+     * @return  Current number of token holders.
+     */
+    function totalMembers() external view returns (uint256) {
+        return _memberCount;
+    }
+
+    /**
+     * @notice Returns the membership ID for `account`, or 0 if none.
+     * @dev    IDs start at 1; 0 is the unambiguous "no membership" sentinel.
+     *         O(1) single SLOAD.
+     * @param  account  Address to query.
+     * @return          Membership ID (= token ID in v1), or 0.
+     */
+    function getMemberId(address account) external view returns (uint256) {
+        return _memberToken[account];
+    }
+
+    /**
+     * @notice Returns the ERC-721 token ID held by `account`, or 0 if none.
+     * @dev    Alias for getMemberId(). Reads the same storage slot.
+     * @param  account  Address to query.
+     * @return          Token ID, or 0.
      */
     function tokenOf(address account) external view returns (uint256) {
-        return _tokenOf[account];
+        return _memberToken[account];
     }
 
     /**
      * @notice Returns whether `account` has been explicitly approved.
-     * @dev    Always check approvalRequired first — this value is only
-     *         meaningful when approvalRequired == true.
-     * @param  account Address to query.
-     * @return         True if account has been approved.
+     * @dev    Only meaningful when approvalRequired == true.
+     * @param  account  Address to query.
+     * @return          True if explicitly approved.
      */
     function isApproved(address account) external view returns (bool) {
         return _approved[account];
     }
 
     /**
-     * @notice Returns the next token ID that will be minted.
-     * @dev    Useful for off-chain indexers predicting the upcoming token ID.
+     * @notice Returns the token ID that will be assigned to the next mint.
+     * @dev    Not reserved; another tx may mine first.
+     * @return  Current _nextTokenId value.
      */
     function nextTokenId() external view returns (uint256) {
         return _nextTokenId;
     }
 
-    /**
-     * @notice Returns the total number of active (non-burned) tokens.
-     * @dev    Delegates to ERC721Enumerable.totalSupply().
-     */
-    function totalMembers() external view returns (uint256) {
-        return totalSupply();
-    }
-
     // =========================================================================
-    // Internal — Core Mint / Burn Logic
+    // Internal -- Mint / Burn
     // =========================================================================
 
     /**
-     * @dev Internal mint: increments _nextTokenId, calls _safeMint.
-     *      _update() (below) handles the one-per-address check and _tokenOf.
+     * @dev Shared internal mint path.
+     *      1. Post-increment _nextTokenId (unchecked -- 2^256 overflow impossible).
+     *      2. _safeMint -> _update() enforces one-per-address + writes _memberToken.
+     *      3. Increment _memberCount (unchecked).
+     *      4. Emit MembershipMinted.
      */
     function _mintMembership(address to) internal {
         uint256 tokenId;
         unchecked { tokenId = _nextTokenId++; }
         _safeMint(to, tokenId);
-        emit MembershipMinted(to, tokenId);
+        unchecked { ++_memberCount; }
+        emit MembershipMinted(to, tokenId, tokenId, _memberCount);
     }
 
     /**
-     * @dev Internal burn: calls _burn, clears approval state.
-     *      _update() (below) handles clearing _tokenOf.
+     * @dev Shared internal burn path. Caller pre-reads tokenId to save one SLOAD.
+     *      1. _burn -> _update() clears _memberToken[account].
+     *      2. Decrement _memberCount (unchecked -- token existed so count >= 1).
+     *      3. delete _approved[account].
+     *      4. Emit MembershipRevoked.
      */
     function _burnMembership(address account, uint256 tokenId) internal {
         _burn(tokenId);
+        unchecked { --_memberCount; }
         delete _approved[account];
-        emit MembershipBurned(account, tokenId);
+        emit MembershipRevoked(account, tokenId, tokenId, _memberCount);
     }
 
     // =========================================================================
-    // Internal — ERC721 Hooks
+    // Internal -- ERC-721 _update Hook
     // =========================================================================
 
     /**
-     * @dev Override _update — the single internal hook that all ERC-721
-     *      state transitions (mint, burn, transfer) flow through in OZ v5.
+     * @dev Single hook covering every ERC-721 state transition (OZ v5).
      *
-     *      Responsibilities:
-     *        1. One-per-address: reject if `to` already holds a token (mint/transfer).
-     *        2. Transferability: reject non-mint, non-burn transfers when locked.
-     *        3. Pause: reject all state changes when paused (except burn).
-     *        4. _tokenOf bookkeeping: update forward mapping on every transition.
-     *
-     *      Why here and not in separate before/after hooks?
-     *        OZ v5 consolidates into _update(). A single override is cleaner,
-     *        avoids hook ordering bugs, and is cheaper (one call frame).
-     *
-     * @param  to      Recipient (address(0) for burns).
-     * @param  tokenId Token being moved.
-     * @param  auth    Authorisation address (checked by OZ internals).
-     * @return         Previous owner (returned by super._update).
+     *      Rule 1  Pause gate    -- all transitions revert when paused, except burns.
+     *      Rule 2  Soulbound     -- wallet-to-wallet transfers revert when !transferable.
+     *      Rule 3  One-per-addr  -- destination must not already hold a token.
+     *      Rule 4  Bookkeeping   -- _memberToken kept in sync on every transition.
      */
     function _update(
         address to,
@@ -549,76 +687,41 @@ contract VaultMatesMembership is
         address auth
     )
         internal
-        override(ERC721, ERC721Enumerable)
+        override
         returns (address)
     {
-        address from = _ownerOf(tokenId); // address(0) on mint
+        address from = _ownerOf(tokenId);
 
         bool isMint = (from == address(0));
         bool isBurn = (to   == address(0));
 
-        // ── Pause check ───────────────────────────────────────────────────────
-        // Burns bypass pause so users can always exit and admins can enforce.
-        if (paused() && !isBurn) revert EnforcedPause();
+        if (paused() && !isBurn)                    revert EnforcedPause();
+        if (!transferable && !isMint && !isBurn)    revert TransferLocked();
 
-        // ── Transferability check ─────────────────────────────────────────────
-        // Mints and burns are always allowed regardless of the transferable flag.
-        if (!transferable && !isMint && !isBurn) revert TransferLocked();
-
-        // ── One-per-address check ─────────────────────────────────────────────
-        // `to` must not already own a token (applies to mints and transfers).
-        if (!isBurn && _tokenOf[to] != 0) {
+        if (!isBurn && _memberToken[to] != 0) {
             if (isMint) revert AlreadyMember(to);
             revert TargetAlreadyMember(to);
         }
 
-        // ── _tokenOf bookkeeping ──────────────────────────────────────────────
-        if (!isMint) delete _tokenOf[from]; // clear sender on transfer or burn
-        if (!isBurn) _tokenOf[to] = tokenId; // set recipient on mint or transfer
+        if (!isMint) delete _memberToken[from];
+        if (!isBurn) _memberToken[to] = tokenId;
 
-        // ── Delegate to OZ chain (handles ERC721 + ERC721Enumerable state) ────
         return super._update(to, tokenId, auth);
     }
 
-    /**
-     * @dev Required override: ERC721 and ERC721Enumerable both implement this.
-     */
-    function _increaseBalance(address account, uint128 value)
-        internal
-        override(ERC721, ERC721Enumerable)
-    {
-        super._increaseBalance(account, value);
-    }
-
     // =========================================================================
-    // Internal — Modifiers
+    // Internal -- EIP-165
     // =========================================================================
 
     /**
-     * @dev Restricts to owner or any APPROVER_ROLE holder.
-     *      Cheaper than writing onlyRole(APPROVER_ROLE) when owner-equivalence
-     *      is also needed, and avoids granting the owner APPROVER_ROLE explicitly
-     *      (though the constructor does grant it for convenience).
-     */
-    modifier onlyApprover() {
-        if (msg.sender != owner() && !hasRole(APPROVER_ROLE, msg.sender)) {
-            revert Unauthorized();
-        }
-        _;
-    }
-
-    // =========================================================================
-    // Internal — EIP-165
-    // =========================================================================
-
-    /**
-     * @dev EIP-165: advertise ERC721, ERC721Enumerable, AccessControl,
-     *      and IMembershipChecker interfaces.
+     * @notice Returns true if this contract implements the given interface.
+     * @dev    Advertises ERC-721, AccessControl, and IMembershipChecker.
+     *         IMembershipChecker checked first to short-circuit the super chain.
      */
     function supportsInterface(bytes4 interfaceId)
         public
         view
-        override(ERC721, ERC721Enumerable, AccessControl)
+        override(ERC721, AccessControl)
         returns (bool)
     {
         return
