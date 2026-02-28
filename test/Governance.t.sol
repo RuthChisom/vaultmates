@@ -21,12 +21,7 @@ contract GovernanceTest is Test {
     function setUp() public {
         vm.startPrank(owner);
         nft = new MembershipNFT(owner);
-        gov = new Governance(
-            owner,
-            address(nft),
-            5000,   // 50% quorum
-            3 days
-        );
+        gov = new Governance(owner, address(nft), 5000, 3 days);
 
         nft.mintMembershipNFT(alice, "");
         nft.mintMembershipNFT(bob, "");
@@ -38,10 +33,6 @@ contract GovernanceTest is Test {
         twoOptions[0] = "Approve";
         twoOptions[1] = "Reject";
     }
-
-    // -------------------------------------------------------------------------
-    // Proposal creation
-    // -------------------------------------------------------------------------
 
     function test_CreateProposal() public {
         vm.prank(alice);
@@ -69,16 +60,12 @@ contract GovernanceTest is Test {
         gov.createProposal("title", "desc", oneOpt, destination, 1 ether);
     }
 
-    // -------------------------------------------------------------------------
-    // Voting
-    // -------------------------------------------------------------------------
-
     function test_MemberCanVote() public {
         vm.prank(alice);
         uint256 pid = gov.createProposal("title", "desc", twoOptions, destination, 1 ether);
 
         vm.prank(alice);
-        gov.vote(pid, 0); // Approve
+        gov.vote(pid, 0);
 
         assertEq(gov.getOptionVotes(pid, 0), 1);
     }
@@ -106,10 +93,6 @@ contract GovernanceTest is Test {
         gov.vote(pid, 0);
     }
 
-    // -------------------------------------------------------------------------
-    // Finalization
-    // -------------------------------------------------------------------------
-
     function test_ProposalPassesWithMajority() public {
         vm.prank(alice);
         uint256 pid = gov.createProposal("title", "desc", twoOptions, destination, 1 ether);
@@ -131,7 +114,6 @@ contract GovernanceTest is Test {
         vm.prank(alice);
         uint256 pid = gov.createProposal("title", "desc", twoOptions, destination, 1 ether);
 
-        // Only 1 of 3 members vote (below 50% quorum)
         vm.prank(alice);
         gov.vote(pid, 0);
 

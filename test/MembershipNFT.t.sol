@@ -16,10 +16,6 @@ contract MembershipNFTTest is Test {
         nft = new MembershipNFT(owner);
     }
 
-    // -------------------------------------------------------------------------
-    // Minting
-    // -------------------------------------------------------------------------
-
     function test_MintMembership() public {
         vm.prank(owner);
         nft.mintMembershipNFT(alice, "ipfs://alice-metadata");
@@ -51,10 +47,6 @@ contract MembershipNFTTest is Test {
         nft.mintMembershipNFT(bob, "");
     }
 
-    // -------------------------------------------------------------------------
-    // Revocation
-    // -------------------------------------------------------------------------
-
     function test_RevokeMembership() public {
         vm.startPrank(owner);
         nft.mintMembershipNFT(alice, "");
@@ -82,10 +74,6 @@ contract MembershipNFTTest is Test {
         nft.revokeMembership(alice);
     }
 
-    // -------------------------------------------------------------------------
-    // Soulbound
-    // -------------------------------------------------------------------------
-
     function test_TransferReverts() public {
         vm.prank(owner);
         nft.mintMembershipNFT(alice, "");
@@ -94,10 +82,6 @@ contract MembershipNFTTest is Test {
         vm.expectRevert(MembershipNFT.SoulboundToken.selector);
         nft.transferFrom(alice, bob, 1);
     }
-
-    // -------------------------------------------------------------------------
-    // Fuzz
-    // -------------------------------------------------------------------------
 
     function testFuzz_MultipleMembersCheckMembership(uint8 count) public {
         vm.assume(count > 0 && count < 50);

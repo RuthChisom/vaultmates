@@ -19,19 +19,13 @@ contract VaultTest is Test {
         nft = new MembershipNFT(owner);
         vault = new Vault(owner, address(nft));
         vault.setExecutor(executor);
-
         nft.mintMembershipNFT(alice, "");
         nft.mintMembershipNFT(bob, "");
         vm.stopPrank();
 
-        // Fund test accounts
         vm.deal(alice, 10 ether);
         vm.deal(bob, 10 ether);
     }
-
-    // -------------------------------------------------------------------------
-    // Deposit
-    // -------------------------------------------------------------------------
 
     function test_DepositFunds() public {
         vm.prank(alice);
@@ -67,10 +61,6 @@ contract VaultTest is Test {
         vault.depositFunds{value: 0}();
     }
 
-    // -------------------------------------------------------------------------
-    // Withdraw
-    // -------------------------------------------------------------------------
-
     function test_WithdrawFunds() public {
         vm.prank(alice);
         vault.depositFunds{value: 3 ether}();
@@ -95,10 +85,6 @@ contract VaultTest is Test {
         vault.withdrawFunds(2 ether);
     }
 
-    // -------------------------------------------------------------------------
-    // Fund Allocation
-    // -------------------------------------------------------------------------
-
     function test_ExecutorCanAllocateFunds() public {
         vm.prank(alice);
         vault.depositFunds{value: 5 ether}();
@@ -120,10 +106,6 @@ contract VaultTest is Test {
         vm.expectRevert(Vault.Unauthorized.selector);
         vault.allocateFunds(bob, 1 ether);
     }
-
-    // -------------------------------------------------------------------------
-    // Fuzz
-    // -------------------------------------------------------------------------
 
     function testFuzz_DepositAndWithdraw(uint96 depositAmt, uint96 withdrawAmt) public {
         vm.assume(depositAmt > 0 && depositAmt <= 5 ether);
