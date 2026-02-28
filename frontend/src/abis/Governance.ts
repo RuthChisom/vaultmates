@@ -1,0 +1,17 @@
+export const GovernanceABI = [
+  "function proposalCount() view returns (uint256)",
+  "function memberCount() view returns (uint256)",
+  "function quorumBps() view returns (uint256)",
+  "function getProposal(uint256 proposalId) view returns (tuple(uint256 id, address proposer, string title, string description, address destination, uint256 fundAmount, uint256 votesFor, uint256 votesAgainst, uint256 deadline, uint8 status, string[] options))",
+  "function getProposalStatus(uint256 proposalId) view returns (uint8)",
+  "function getVote(uint256 proposalId, address voter) view returns (uint256)",
+  "function getOptionVotes(uint256 proposalId, uint256 optionIndex) view returns (uint256)",
+  "function createProposal(string title, string description, string[] options, address destination, uint256 fundAmount) returns (uint256)",
+  "function vote(uint256 proposalId, uint256 optionIndex)",
+  "function finalizeProposal(uint256 proposalId)",
+  "function cancelProposal(uint256 proposalId)",
+  "function syncMemberCount(uint256 count)",
+  "event ProposalCreated(uint256 indexed proposalId, address indexed proposer, string title, uint256 deadline)",
+  "event VoteCast(uint256 indexed proposalId, address indexed voter, uint256 optionIndex, uint256 weight)",
+  "event ProposalFinalized(uint256 indexed proposalId, uint8 status)",
+] as const;
