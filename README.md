@@ -1,66 +1,139 @@
-## Foundry
+# VaultMates – AI-Managed Collaborative Vault DAO
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+VaultMates is a decentralised autonomous organisation (DAO) where members collaboratively manage a shared treasury, create investment proposals, and let Claude AI provide recommendations before voting. Approved proposals are executed automatically on-chain.
 
-Foundry consists of:
+## Architecture
 
--   **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
--   **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
--   **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
--   **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+```
+┌─────────────────────────────────────────────────────────┐
+│                      VaultMates DAO                     │
+│                                                         │
+│  ┌──────────────┐     ┌──────────────────────────────┐  │
+│  │ MembershipNFT│────▶│           Vault              │  │
+│  │  (Module 1)  │     │         (Module 2)           │  │
+│  └──────────────┘     └──────────────┬───────────────┘  │
+│                                      │ allocateFunds    │
+│  ┌──────────────┐     ┌──────────────▼───────────────┐  │
+│  │  Governance  │────▶│           Executor           │  │
+│  │  (Module 3)  │     │          (Module 5)          │  │
+│  └──────────────┘     └──────────────────────────────┘  │
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │         AIRecommendation (Module 4)             │    │
+│  │   Off-chain Claude AI ──▶ On-chain storage      │    │
+│  └─────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────┘
+```
 
-## Documentation
+## Modules
 
-https://book.getfoundry.sh/
+| # | Contract | Purpose |
+|---|---|---|
+| 1 | `MembershipNFT.sol` | Soulbound ERC-721 membership tokens. Mint/revoke via owner. |
+| 2 | `Vault.sol` | Pool member deposits; track per-user balances; authorise fund allocation. |
+| 3 | `Governance.sol` | Create proposals, cast votes, finalize outcomes. |
+| 4 | `AIRecommendation.sol` | Store Claude AI risk/reward scores and recommendation text per proposal. |
+| 5 | `Executor.sol` | Automatically execute passed proposals and log every action on-chain. |
 
-## Usage
+### Interfaces
+- `IMembership` – shared membership check consumed by Vault & Governance
+- `IVault` – fund allocation interface consumed by Executor
+- `IGovernance` – proposal status interface consumed by Executor
+
+## Quick Start
+
+### Prerequisites
+- [Foundry](https://book.getfoundry.sh/getting-started/installation)
+
+### Install dependencies
+```bash
+forge install
+```
 
 ### Build
-
-```shell
-$ forge build
+```bash
+forge build
 ```
 
 ### Test
-
-```shell
-$ forge test
+```bash
+forge test -vvv
 ```
 
-### Format
+### Deploy (local Anvil)
+```bash
+# Start local node
+anvil
 
-```shell
-$ forge fmt
+# Deploy
+cp .env.example .env   # fill in values
+forge script script/Deploy.s.sol:DeployScript \
+  --rpc-url http://localhost:8545 \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+  --broadcast
 ```
 
-### Gas Snapshots
-
-```shell
-$ forge snapshot
+### Deploy (Flow EVM Testnet)
+```bash
+forge script script/Deploy.s.sol:DeployScript \
+  --rpc-url $RPC_URL \
+  --private-key $PRIVATE_KEY \
+  --broadcast \
+  --verify
 ```
 
-### Anvil
+## Key Flows
 
-```shell
-$ anvil
+### 1. Onboard a Member
+```
+owner → MembershipNFT.mintMembershipNFT(user, metadataURI)
 ```
 
-### Deploy
-
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
+### 2. Deposit Funds
+```
+member → Vault.depositFunds{value: X}()
 ```
 
-### Cast
-
-```shell
-$ cast <subcommand>
+### 3. Create a Proposal
+```
+member → Governance.createProposal(title, description, options, destination, amount)
 ```
 
-### Help
-
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
+### 4. Add AI Recommendation (off-chain Claude → on-chain)
 ```
+aiOracle → AIRecommendation.addAIRecommendation(proposalId, text, riskScore, rewardScore)
+```
+
+### 5. Vote
+```
+member → Governance.vote(proposalId, optionIndex)
+```
+
+### 6. Finalize (after deadline)
+```
+anyone → Governance.finalizeProposal(proposalId)
+```
+
+### 7. Execute Approved Proposal
+```
+anyone → Executor.executeProposal(proposalId)
+         └──▶ Vault.allocateFunds(destination, amount)
+         └──▶ Governance.markExecuted(proposalId)
+         └──▶ emits ProposalExecuted event with full log
+```
+
+## Environment Variables
+
+See [`.env.example`](.env.example) for all configuration options.
+
+## Roadmap / What's Next
+
+- [ ] **Module 6 – Privacy/Security**: Lit Protocol integration for encrypted voting
+- [ ] **Frontend**: React/HTML demo showing vault state, proposals, and AI recommendations
+- [ ] **Token-weighted voting**: Replace 1-member-1-vote with stake-proportional weight
+- [ ] **Flow SDK walletless onboarding**: Email / passkey account creation
+- [ ] **Automated quorum sync**: Event-driven `syncMemberCount` via oracle or Chainlink
+
+## License
+
+MIT
